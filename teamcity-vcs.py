@@ -18,7 +18,7 @@ Options:
     
     # Import options
     --update-projects    Update projects' VCS roots from CSV file
-    --update-builds      Assign VCS roots to builds from CSV file
+    --update-builds      Update VCS roots for builds from CSV file (attach or detach)
     --input-file FILE    Specify input CSV file for updates
 
 Output:
@@ -29,6 +29,12 @@ Output:
     - VCS Root Name
     - Fetch URL
     - Default Branch
+
+CSV Format for --update-builds:
+    The CSV file should have the following columns:
+    - Build ID (required): The ID of the build configuration
+    - VCS Root ID (required): The ID of the VCS root
+    - Action (optional): A for attach (default), D for detach
 
 Environment Variables:
     TEAMCITY_BASE_URL: TeamCity server base URL (default: http://your-teamcity-server.local/app/rest)
@@ -269,7 +275,12 @@ def read_builds_csv(file_path):
     """Read and validate a CSV file for updating builds.
     
     Expected CSV format:
-    Build ID, Build Name, VCS Root ID, VCS Root Name
+    Build ID, Build Name, VCS Root ID, VCS Root Name, Action
+    
+    Action column can have the following values:
+    - A: Attach the VCS root to the build
+    - D: Detach the VCS root from the build
+    If Action is not specified, the default is to attach (A).
     
     Args:
         file_path: Path to the CSV file
@@ -302,10 +313,17 @@ def read_builds_csv(file_path):
                     print(f"Warning: Skipping row with missing Build ID or VCS Root ID: {row}", file=sys.stderr)
                     continue
                 
+                # Get action (default to 'A' if not specified or invalid)
+                action = row.get("Action", "A").upper()
+                if action not in ["A", "D"]:
+                    print(f"Warning: Invalid action '{action}' for build {row['Build ID']}, defaulting to 'A'", file=sys.stderr)
+                    action = "A"
+                
                 # Add to builds data
                 builds_data.append({
                     "build_id": row["Build ID"],
-                    "vcs_root_id": row["VCS Root ID"]
+                    "vcs_root_id": row["VCS Root ID"],
+                    "action": action
                 })
     
     except FileNotFoundError:
@@ -398,6 +416,61 @@ def update_vcs_root_properties(vcs_root_id, fetch_url=None, default_branch=None)
         
     except requests.RequestException as e:
         print(f"Error updating VCS root {vcs_root_id}: {e}", file=sys.stderr)
+        return False
+
+
+def detach_vcs_root_from_build(build_id, vcs_root_id):
+    """Detach a VCS root from a build configuration.
+    
+    Args:
+        build_id: The ID of the build configuration
+        vcs_root_id: The ID of the VCS root to detach
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # First, check if the build exists
+        resp = requests.get(f"{BASE_URL}/buildTypes/id:{build_id}", headers=HEADERS)
+        if resp.status_code == 404:
+            print(f"Error: Build configuration not found: {build_id}", file=sys.stderr)
+            return False
+        resp.raise_for_status()
+        
+        # Check if the VCS root exists
+        resp = requests.get(f"{BASE_URL}/vcs-roots/id:{vcs_root_id}", headers=HEADERS)
+        if resp.status_code == 404:
+            print(f"Error: VCS root not found: {vcs_root_id}", file=sys.stderr)
+            return False
+        resp.raise_for_status()
+        
+        # Check if the VCS root is attached to the build
+        resp = requests.get(f"{BASE_URL}/buildTypes/id:{build_id}/vcs-root-entries", headers=HEADERS)
+        resp.raise_for_status()
+        vcs_entries = resp.json().get("vcs-root-entry", [])
+        
+        entry_id = None
+        for entry in vcs_entries:
+            if entry.get("vcs-root", {}).get("id") == vcs_root_id:
+                entry_id = entry.get("id")
+                break
+        
+        if not entry_id:
+            print(f"VCS root {vcs_root_id} is not attached to build {build_id}")
+            return True
+        
+        # Detach the VCS root from the build
+        resp = requests.delete(
+            f"{BASE_URL}/buildTypes/id:{build_id}/vcs-root-entries/id:{entry_id}",
+            headers=HEADERS
+        )
+        resp.raise_for_status()
+        
+        print(f"Successfully detached VCS root {vcs_root_id} from build {build_id}")
+        return True
+        
+    except requests.RequestException as e:
+        print(f"Error detaching VCS root {vcs_root_id} from build {build_id}: {e}", file=sys.stderr)
         return False
 
 
@@ -502,7 +575,11 @@ def update_projects_from_csv(file_path):
 
 
 def update_builds_from_csv(file_path):
-    """Assign VCS roots to builds from a CSV file.
+    """Update VCS roots for builds from a CSV file.
+    
+    The CSV file can specify an action for each build:
+    - A: Attach the VCS root to the build (default)
+    - D: Detach the VCS root from the build
     
     Args:
         file_path: Path to the CSV file
@@ -524,16 +601,29 @@ def update_builds_from_csv(file_path):
     for build in builds_data:
         build_id = build["build_id"]
         vcs_root_id = build["vcs_root_id"]
+        action = build.get("action", "A")  # Default to attach if not specified
         
         # Skip if VCS root ID is "None"
         if vcs_root_id == "None":
             print(f"Skipping build {build_id} with no VCS root")
             continue
         
-        # Assign VCS root to build
-        if assign_vcs_root_to_build(build_id, vcs_root_id):
-            success_count += 1
+        # Perform the specified action
+        if action == "A":
+            # Attach VCS root to build
+            if assign_vcs_root_to_build(build_id, vcs_root_id):
+                success_count += 1
+            else:
+                failure_count += 1
+        elif action == "D":
+            # Detach VCS root from build
+            if detach_vcs_root_from_build(build_id, vcs_root_id):
+                success_count += 1
+            else:
+                failure_count += 1
         else:
+            # This should never happen as we validate the action in read_builds_csv
+            print(f"Warning: Unknown action '{action}' for build {build_id}", file=sys.stderr)
             failure_count += 1
     
     return success_count, failure_count
@@ -549,7 +639,7 @@ def main():
     mode_group.add_argument("--builds", action="store_true", help="List all build configurations and their VCS roots (default)")
     mode_group.add_argument("--projects", action="store_true", help="List all projects and their VCS roots")
     mode_group.add_argument("--update-projects", action="store_true", help="Update projects' VCS roots from CSV file")
-    mode_group.add_argument("--update-builds", action="store_true", help="Assign VCS roots to builds from CSV file")
+    mode_group.add_argument("--update-builds", action="store_true", help="Update VCS roots for builds from CSV file (attach or detach)")
     
     # Add input file option for update modes
     parser.add_argument("--input-file", help="Specify input CSV file for updates")
