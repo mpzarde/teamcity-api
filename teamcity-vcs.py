@@ -47,10 +47,15 @@ import sys
 import argparse
 import requests
 import warnings
-from urllib3.exceptions import NotOpenSSLWarning
 
-# Suppress specific urllib3 warning
-warnings.filterwarnings('ignore', category=NotOpenSSLWarning)
+# Try to import NotOpenSSLWarning, but handle if it doesn't exist in newer urllib3 versions
+try:
+    from urllib3.exceptions import NotOpenSSLWarning
+    # Suppress specific urllib3 warning
+    warnings.filterwarnings('ignore', category=NotOpenSSLWarning)
+except ImportError:
+    # NotOpenSSLWarning doesn't exist in this urllib3 version, so we can ignore this
+    pass
 
 # Configuration
 BASE_URL = os.getenv("TEAMCITY_BASE_URL", "http://your-teamcity-server.local/app/rest")
@@ -102,16 +107,17 @@ def get_vcs_root_details(vcs_root_id):
         vcs_root_id: The ID of the VCS root
         
     Returns:
-        Tuple: (vcs_name, fetch_url, default_branch) or (None, None, None) if not found
+        Tuple: (vcs_name, fetch_url, default_branch, vcs_type) or (None, None, None, None) if not found
     """
     try:
         resp = requests.get(f"{BASE_URL}/vcs-roots/id:{vcs_root_id}", headers=HEADERS)
         if resp.status_code == 404:
-            return None, None, None
+            return None, None, None, None
         resp.raise_for_status()
         data = resp.json()
         
         vcs_name = data.get("name")
+        vcs_type = data.get("vcsName")  # Extract VCS type (e.g., "jetbrains.git", "mercurial")
         
         # Extract properties from the response
         properties = data.get("properties", {}).get("property", [])
@@ -119,18 +125,21 @@ def get_vcs_root_details(vcs_root_id):
         default_branch = None
         
         for prop in properties:
-            if prop.get("name") == "url":
-                fetch_url = prop.get("value")
-            elif prop.get("name") == "branch":
-                default_branch = prop.get("value")
+            name = prop.get("name")
+            value = prop.get("value")
+
+            if name in ("url", "repositoryPath"):
+                fetch_url = value
+            elif name in ("branch", "branchName"):
+                default_branch = value
         
-        return vcs_name, fetch_url, default_branch
+        return vcs_name, fetch_url, default_branch, vcs_type
     except requests.RequestException:
-        return None, None, None
+        return None, None, None, None
 
 def get_vcs_root_name(vcs_root_id):
     """Get the name of a VCS root (legacy function)."""
-    vcs_name, _, _ = get_vcs_root_details(vcs_root_id)
+    vcs_name, _, _, _ = get_vcs_root_details(vcs_root_id)
     return vcs_name
 
 
@@ -160,7 +169,7 @@ def get_all_build_details():
                     for entry in vcs_entries:
                         vcs_id = entry.get("vcs-root", {}).get("id")
                         if vcs_id:
-                            vcs_name, _, _ = get_vcs_root_details(vcs_id)
+                            vcs_name, _, _, _ = get_vcs_root_details(vcs_id)
                             if vcs_name:
                                 build_details.add((build_id, build_name, vcs_name, vcs_id))
                 else:
@@ -203,7 +212,7 @@ def get_all_projects_with_vcs_roots():
                     for entry in vcs_entries:
                         vcs_id = entry.get("vcs-root", {}).get("id")
                         if vcs_id:
-                            vcs_name, fetch_url, default_branch = get_vcs_root_details(vcs_id)
+                            vcs_name, fetch_url, default_branch, _ = get_vcs_root_details(vcs_id)
                             if vcs_name:
                                 project_details.add((project_id, project_name, vcs_name, vcs_id, fetch_url, default_branch))
                                 vcs_roots_found = True
@@ -353,7 +362,18 @@ def update_vcs_root_properties(vcs_root_id, fetch_url=None, default_branch=None)
     print(f"Updating VCS root: {vcs_root_id}")
     
     try:
-        # First, get the current VCS root details
+        # First, get the current VCS root details including VCS type
+        _, _, _, vcs_type = get_vcs_root_details(vcs_root_id)
+        
+        if vcs_type is None:
+            print(f"Error: Could not determine VCS type for {vcs_root_id}", file=sys.stderr)
+            return False
+        
+        # Determine property names based on VCS type
+        url_property_name = "repositoryPath" if "mercurial" in vcs_type.lower() else "url"
+        branch_property_name = "branchName" if "mercurial" in vcs_type.lower() else "branch"
+        
+        # Get the current VCS root data
         resp = requests.get(f"{BASE_URL}/vcs-roots/id:{vcs_root_id}", headers=HEADERS)
         if resp.status_code == 404:
             print(f"Error: VCS root not found: {vcs_root_id}", file=sys.stderr)
@@ -372,22 +392,22 @@ def update_vcs_root_properties(vcs_root_id, fetch_url=None, default_branch=None)
         
         # First, update existing properties
         for prop in property_list:
-            if prop.get("name") == "url" and fetch_url is not None:
+            if prop.get("name") == url_property_name and fetch_url is not None:
                 prop["value"] = fetch_url
                 updated = True
                 url_found = True
-            elif prop.get("name") == "branch" and default_branch is not None:
+            elif prop.get("name") == branch_property_name and default_branch is not None:
                 prop["value"] = default_branch
                 updated = True
                 branch_found = True
         
         # Add properties if they don't exist
         if fetch_url is not None and not url_found:
-            property_list.append({"name": "url", "value": fetch_url})
+            property_list.append({"name": url_property_name, "value": fetch_url})
             updated = True
             
         if default_branch is not None and not branch_found:
-            property_list.append({"name": "branch", "value": default_branch})
+            property_list.append({"name": branch_property_name, "value": default_branch})
             updated = True
         
         # If no properties were updated, return early
